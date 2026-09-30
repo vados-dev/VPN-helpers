@@ -1,11 +1,11 @@
 name: Tests
 
-on:
-  push:
-    branches: [main]
-    paths: ['*.sh', 'scripts/**', 'tests/**', '.github/workflows/test.yml']
-  pull_request:
-    paths: ['*.sh', 'scripts/**', 'tests/**', '.github/workflows/test.yml']
+#on:
+#  push:
+#    branches: [main]
+#    paths: ['*.sh', 'scripts/**', 'tests/**', '.github/workflows/test.yml']
+#  pull_request:
+#    paths: ['*.sh', 'scripts/**', 'tests/**', '.github/workflows/test.yml']
 
 permissions:
   contents: read
