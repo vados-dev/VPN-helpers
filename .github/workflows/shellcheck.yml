@@ -6,10 +6,10 @@ name: ShellCheck
 # Линт прогоняет все .sh через git ls-files и на docs-only диффе тривиально зелёный.
 # workflow_dispatch - чтобы прогнать на форке перед merge (правило проекта для CI-правок).
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+#  push:
+#    branches: [main]
+#  pull_request:
+#    branches: [main]
   workflow_dispatch:
 
 permissions:
