@@ -20,6 +20,9 @@
 *.timer     text eol=lf
 *.template  text eol=lf
 *.txt       text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.sh        linguist-language=Shell
 LICENSE     text eol=lf
 
 *.png binary

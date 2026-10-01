@@ -1,0 +1,43 @@
+name: Upload latest release on gh-pages
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: write
+
+jobs:
+  Update-Latest-Release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download release zip
+        run: wget https://github.com/sovokan/amneziawg-server-tools/releases/download/${{ github.event.release.tag_name }}/amneziawg-server-tools-${{ github.event.release.tag_name }}.zip
+
+      - name: Download release tar.gz
+        run: wget https://github.com/sovokan/amneziawg-server-tools/releases/download/${{ github.event.release.tag_name }}/amneziawg-server-tools-${{ github.event.release.tag_name }}.tar.gz
+
+      - name: Rename release zip
+        run: mv -f amneziawg-server-tools-${{ github.event.release.tag_name }}.zip amneziawg-server-tools-latest.zip
+
+      - name: Rename release tar.gz
+        run: mv -f amneziawg-server-tools-${{ github.event.release.tag_name }}.tar.gz amneziawg-server-tools-latest.tar.gz
+
+      - name: Create commit
+        run: |
+          git add amneziawg-server-tools-latest.zip amneziawg-server-tools-latest.tar.gz
+          git commit -m "Update latest release to ${{ github.event.release.tag_name }}"
+
+      - name: Upload
+        run: git push origin gh-pages
