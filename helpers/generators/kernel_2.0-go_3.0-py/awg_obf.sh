@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+
+# awg_obf.sh — настройка обфускации AmneziaWG.
+# Генерирует согласованный набор параметров (пресет + шаблон
+# мимикрии), сохраняет его в state-файл и применяет ОДИНАКОВО к серверу и всем
+# будущим клиентам. Может работать интерактивно (меню) и по флагам (для
+# установщика и Telegram-бота).
+#
+# Использование:
+#   awg_obf.sh                 # интерактивное меню
+#   awg_obf.sh --preset high --template web --fp chrome --apply
+#   awg_obf.sh --show          # показать текущий профиль
+#   awg_obf.sh --regenerate    # перегенерировать I-пакеты (новые сигнатуры)
+#   awg_obf.sh --reapply       # применить текущий профиль заново (значения не меняются, клиенты живы)
+#
+# Параметры (кроме Jc/Jmin/Jmax) обязаны совпадать client<->server — поэтому
+# единый источник истины: $STATE_ENV. client-awg.sh читает его же.
+set -euo pipefail
+
+PROGRAM="${0##*/}"
+ARGS=( "$@" )
+#awg_exec="$(echo "$PROGRAM" | cut -d'-' -f1)"
+cmd() { printf '  [\033[1;33m✨\033[0m]\033[1m %s \033[0m\n' "$*" >&2; "$@"; }
+log() { printf ' \033[1;8m 📋[%s] %s.\033[0m\n' "$PROGRAM" "$*"; }
+err() { printf ' \033[1;35m 💡[%s]\033[0;1m Error: %s!\033[0m\n' "$PROGRAM" "$*" >&2; }
+die() { printf ' \033[1;31m ❌[%s]\033[0;1m Critical Error: %s!\033[0m\n' "$PROGRAM" "$*" >&2; exit 1; }
+
+### Пути:
+#########
+SELF="$(dirname $(readlink -f "${BASH_SOURCE[0]}"))"
+
+#AWG_DIR="${AWG_DIR:-/etc/amnezia/amneziawg}"   # переопределяется для тестов
+######
+die "Разберитесь с путями!"
+######
+
+# Слой 2.0 и слой 3.0 держат РАЗНЫЕ профили: у 3.0 другой набор параметров
+# и другой MTU, а смешивать их нельзя — стороны должны совпадать внутри слоя.
+STATE_ENV="${AWG_DIR}/obfuscation.env"          # AWG_* переменные (единый источник)
+STATE_META="${AWG_DIR}/obfuscation.meta"        # preset/template/fp/host/mtu
+GEN="$(dirname "$(readlink -f "$0")")/../obfuscation/awg_obfuscate.py"
+[ -f "$GEN" ] ||  # GEN="/opt/awg3/awg_obfuscate.py"   # fallback после установки
+# К каким серверным конфигам применять профиль. По умолчанию — интерфейс
+# своего слоя из services.env; переменная AWG_CONFS задаёт список явно.
+SERVICES="${AWG_DIR}/services.env"
+# shellcheck disable=SC1090
+[ -f "$SERVICES" ] && . "$SERVICES" 2>/dev/null || true
+CONFS="${AWG_CONFS:-${AWG_DIR}/${IFACE2:-awg2}.conf}"
+
+PRESET="medium"; TEMPLATE=""; FP="chrome"; HOST=""; MTU=0; EXTREME=0
+APPLY=0; SHOW=0; REGEN=0; INTERACTIVE=1
+# --reapply: разложить уже сгенерированный профиль заново, ничего не меняя
+REAPPLY=0
+# --v3: генерировать профиль для слоя AmneziaWG 3.0 (свои файлы состояния,
+# параметры header protection / content padding / таймингов)
+V3=0
+
+# ── парсинг флагов ────────────────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --preset)    PRESET="$2"; SET_PRESET=1; shift 2; INTERACTIVE=0 ;;
+        --template)  TEMPLATE="$2"; SET_TEMPLATE=1; shift 2; INTERACTIVE=0 ;;
+        --fp)        FP="$2"; SET_FP=1; shift 2 ;;
+        --host)      HOST="$2"; SET_HOST=1; shift 2 ;;
+        --mtu)       MTU="$2"; SET_MTU=1; shift 2 ;;
+        --v3)        V3=1; INTERACTIVE=0; shift ;;
+        --extreme)   EXTREME=1; shift ;;
+        --apply)     APPLY=1; INTERACTIVE=0; shift ;;
+        --show)      SHOW=1; INTERACTIVE=0; shift ;;
+        --regenerate) REGEN=1; INTERACTIVE=0; shift ;;
+        --reapply)   REAPPLY=1; APPLY=1; INTERACTIVE=0; shift ;;
+        # Справка — это ШАПКА файла, а не все его комментарии: ниже по файлу
+        # идут заметки для читателя кода, и владелец получал их вместо справки,
+        # начиная с обрубленного шебанга.
+        -h|--help)   awk 'NR==1||/^# *SPDX-/{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
+        *) echo "Неизвестный флаг: $1" >&2; exit 2 ;;
+    esac
+done
+
+# ── переключение на слой 3.0 ────────────────────────────────────────────────
+if [ "$V3" = 1 ]; then
+    STATE_ENV="${AWG_DIR}/obfuscation3.env"
+    STATE_META="${AWG_DIR}/obfuscation3.meta"
+    GEN="${SELF}/go-3.0py/awg30_obf.py"
+    [ -f "$GEN" ] || die "Разберитесь с путями!" #GEN="/opt/awg3/awg3_obfuscate.py"
+    CONFS="${AWG_CONFS:-${AWG_DIR}/${IFACE3:-awg3}.conf}"
+fi
+
+
+# ── показать текущий профиль ─────────────────────────────────────────────────
+show_current() {
+    if [ -f "$STATE_META" ]; then
+        log "Текущий профиль обфускации:"; sed 's/^/    /' "$STATE_META"
+        echo
+        log "Активные параметры ($(basename "$STATE_ENV")):"; sed 's/^/    /' "$STATE_ENV"
+    else
+        err "Профиль ещё не сгенерирован. Запусти без --show."
+    fi
+}
+[ "$SHOW" = 1 ] && { show_current; exit 0; }
+
+# ── регенерация: те же preset/template, новые I-пакеты и H-диапазоны ──────────
+if [ "$REGEN" = 1 ] && [ -f "$STATE_META" ]; then
+    # Из метаданных берём только то, чего НЕ задали в командной строке. Раньше
+    # они затирали всё подряд, и `--regenerate --preset medium` молча оставлял
+    # прежний пресет: человек видел в выводе не тот, что просил, и решал, что
+    # смена не сработала. Явный флаг должен быть сильнее сохранённого значения.
+    saved_preset="$PRESET"; saved_template="$TEMPLATE"
+    saved_fp="$FP"; saved_host="$HOST"; saved_mtu="$MTU"
+    # shellcheck disable=SC1090
+    . "$STATE_META"
+    [ "${SET_PRESET:-0}" = 1 ]   && PRESET="$saved_preset"     || PRESET="${META_PRESET:-medium}"
+    [ "${SET_TEMPLATE:-0}" = 1 ] && TEMPLATE="$saved_template" || TEMPLATE="${META_TEMPLATE:-}"
+    [ "${SET_FP:-0}" = 1 ]       && FP="$saved_fp"             || FP="${META_FP:-chrome}"
+    [ "${SET_HOST:-0}" = 1 ]     && HOST="$saved_host"         || HOST="${META_HOST:-}"
+    [ "${SET_MTU:-0}" = 1 ]      && MTU="$saved_mtu"           || MTU="${META_MTU:-0}"
+    if [ "${SET_PRESET:-0}" = 1 ] || [ "${SET_TEMPLATE:-0}" = 1 ]; then
+        log "Регенерация профиля: preset=$PRESET template=${TEMPLATE:-default} (задано флагами)"
+    else
+        log "Регенерация профиля: preset=$PRESET template=${TEMPLATE:-default} (новые сигнатуры)"
+    fi
+    APPLY=1
+fi
+
+# ── интерактивное меню ────────────────────────────────────────────────────────
+if [ "$INTERACTIVE" = 1 ]; then
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Настройка обфускации AmneziaWG"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "ПРЕСЕТ ИНТЕНСИВНОСТИ — сколько «шума» добавляем. Больше = скрытнее,"
+    echo "но выше задержка и оверхед по трафику."
+    echo
+    echo "  1) router    — минимум шума. Для слабых устройств-клиентов"
+    echo "                 (Keenetic/MikroTik/RPi) и мобильного интернета."
+    echo "                 Ставь, если важнее стабильность и батарея."
+    echo "  2) low       — лёгкая обфускация. Провайдер почти не мешает,"
+    echo "                 нужен минимальный оверхед."
+    echo "  3) medium    — сбалансированно [по умолчанию]. H-рандом + S1..S4 +"
+    echo "                 1 профиль мимикрии. Подходит большинству."
+    echo "  4) high      — агрессивный провайдер/оператор режет WireGuard."
+    echo "                 Полный набор + 2 I-пакета + транспортная обфускация."
+    echo "  5) paranoid  — жёсткие блокировки (мобильные операторы РФ с активной"
+    echo "                 фильтрацией). Максимум, 3 профиля, MTU 1280 для сотовых."
+    read -rp "Выбор [3]: " c; case "${c:-3}" in
+        1) PRESET=router;; 2) PRESET=low;; 4) PRESET=high;; 5) PRESET=paranoid;; *) PRESET=medium;;
+    esac
+    echo
+    echo "ШАБЛОН МИМИКРИИ — под какой протокол маскировать пакеты. Выбирай тот,"
+    echo "что у ТВОЕГО провайдера точно НЕ блокируется и выглядит естественно."
+    echo
+    echo "  0) авто       — набор по умолчанию для пресета (безопасный выбор)"
+    echo "  1) quic       — под QUIC/HTTP3 (видео, CDN, Discord). Универсально,"
+    echo "                  если QUIC у провайдера ходит свободно."
+    echo "  2) tls        — под HTTPS (TLS 1.3). Если QUIC режут, а 443/TLS — нет."
+    echo "  3) web        — QUIC + TLS вместе. Смешанный веб-трафик, реалистично."
+    echo "  4) voip       — под звонки/WebRTC (DTLS + SIP). Если у оператора VoIP"
+    echo "                  приоритетный и не трогается."
+    echo "  5) dns        — под DNS-запросы. Экзотика, для сетей где всё режут,"
+    echo "                  кроме DNS (иногда работает в отелях/гостевых Wi-Fi)."
+    echo "  6) mixed      — QUIC + TLS + DNS. Максимальная неоднородность профиля."
+    echo
+    echo "  Подсказка: не уверен — оставь 'авто' или выбери 'web'. Для мобильных"
+    echo "  операторов РФ обычно хорошо заходит 'web' или 'quic'."
+    read -rp "Выбор [0]: " t; case "${t:-0}" in
+        1) TEMPLATE=quic;; 2) TEMPLATE=tls;; 3) TEMPLATE=web;; 4) TEMPLATE=voip;; 5) TEMPLATE=dns;; 6) TEMPLATE=mixed;; *) TEMPLATE="";;
+    esac
+    echo
+    echo "ПРОФИЛЬ БРАУЗЕРА — под размеры пакетов какого браузера подгонять junk."
+    echo "  1) chrome [по умолчанию, самый распространённый]  2) firefox  3) safari"
+    read -rp "Выбор [1]: " f; case "${f:-1}" in 2) FP=firefox;; 3) FP=safari;; *) FP=chrome;; esac
+    echo
+    echo "Кастомный домен для мимикрии (напр. yandex.ru). Enter — из встроенного"
+    echo "пула доступных из РФ доменов (Яндекс/VK/Сбер/госуслуги/CDN)."
+    read -rp "Домен: " HOST
+    echo
+    read -rp "Применить к серверу и перезапустить туннели сейчас? [Y/n]: " a
+    case "${a:-Y}" in n|N) APPLY=0;; *) APPLY=1;; esac
+fi
+
+# ── генерация ─────────────────────────────────────────────────────────────────
+GEN_ARGS=(--preset "$PRESET" --fp "$FP")
+[ -n "$TEMPLATE" ] && GEN_ARGS+=(--template "$TEMPLATE")
+[ -n "$HOST" ] && GEN_ARGS+=(--host "$HOST")
+[ "$MTU" != 0 ] && GEN_ARGS+=(--mtu "$MTU")
+[ "$EXTREME" = 1 ] && GEN_ARGS+=(--extreme)
+
+if [ "$REAPPLY" = 1 ]; then
+    # Профиль не трогаем: он уже согласован с выданными клиентами. Нужно лишь
+    # разложить его заново — например когда меняется способ применения
+    # параметров 3.0 (конфиг вместо UAPI при переходе на ядро).
+    [ -s "$STATE_ENV" ] || { err "нет $STATE_ENV — нечего применять"; exit 1; }
+    log "Повторное применение существующего профиля (значения не меняются)"
+else
+    log "Генерация профиля: preset=$PRESET template=${TEMPLATE:-default} fp=$FP"
+    # ГЕНЕРИРУЕМ ПРОФИЛЬ ОДИН РАЗ (в env-формат). Серверный [Interface]-блок выводим
+    # из ТОГО ЖЕ env — иначе два вызова генератора дали бы разные случайные профили,
+    # и обфускация сервера не совпала бы с клиентами (клиенты читают этот же env) →
+    # handshake был бы невозможен.
+    ENV_BLOCK="$(python3 "$GEN" "${GEN_ARGS[@]}" --format env)"
+
+    # ── сохранить state ──────────────────────────────────────────────────────
+    mkdir -p "$AWG_DIR"
+    umask 077
+    printf '%s\n' "$ENV_BLOCK" > "$STATE_ENV"
+fi
+# серверный блок — строго из сохранённого env (порядок ключей фиксирован)
+# Ключи, которые пишутся прямо в [Interface]. Параметры 3.0 попадают сюда
+# только в режиме ядра. Раньше здесь стояло «их понимает awg setconf из ветки
+# feat/awg3» — ветки давно нет, а с пина v3.0.20260805 их разбирают обычные
+# утилиты (config.c: HeaderProtectionKey, ContentPaddingAddition).
+# В обычном режиме они всё равно уезжают отдельным файлом .v3 через UAPI:
+# этот путь рабочий, а замена его на .conf требует проверки на живом сервере.
+CONF_KEYS="Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5"
+if [ "$V3" = 1 ] && [ "${KMOD3:-0}" = 1 ]; then
+    CONF_KEYS="$CONF_KEYS HeaderProtectionKey ContentPaddingAddition RekeyAfterTime"
+    CONF_KEYS="$CONF_KEYS RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts"
+fi
+IFACE_BLOCK="$(
+    . "$STATE_ENV"
+    for k in $CONF_KEYS; do
+        v="AWG_${k}"; val="${!v:-}"
+        [ -n "$val" ] && printf '%s = %s\n' "$k" "$val"
+    done
+    true    # гарантируем нулевой код подоболочки (иначе set -e убьёт скрипт на пустом I5)
+)"
+# ── параметры 3.0 в формате UAPI ────────────────────────────────────────────
+# amneziawg-tools (v1.0.20260618) их не парсит: `awg setconf` упал бы на
+# «Line unrecognized». Поэтому они НЕ идут в .conf, а лежат в <iface>.v3 и
+# применяются awg3-datapath.sh через UAPI-сокет уже после старта демона.
+# Берём их из ТОГО ЖЕ STATE_ENV, что и блок [Interface], — второй запуск
+# генератора дал бы другие случайные значения, и клиенты не сошлись бы с сервером.
+V3_BLOCK=""
+if [ "$V3" = 1 ] && [ "${KMOD3:-0}" != 1 ]; then
+    V3_BLOCK="$(
+        # shellcheck disable=SC1090
+        . "$STATE_ENV"
+        [ -n "${AWG_HPK_HEX:-}" ] && printf 'header_protection_key=%s\n' "$AWG_HPK_HEX"
+        [ -n "${AWG_ContentPaddingAddition:-}" ] && printf 'content_padding_addition=%s\n' "$AWG_ContentPaddingAddition"
+        [ -n "${AWG_RekeyAfterTime:-}" ] && printf 'rekey_after_time=%s\n' "$AWG_RekeyAfterTime"
+        [ -n "${AWG_RekeyTimeout:-}" ] && printf 'rekey_timeout=%s\n' "$AWG_RekeyTimeout"
+        [ -n "${AWG_RejectAfterTime:-}" ] && printf 'reject_after_time=%s\n' "$AWG_RejectAfterTime"
+        [ -n "${AWG_KeepaliveTimeout:-}" ] && printf 'keepalive_timeout=%s\n' "$AWG_KeepaliveTimeout"
+        [ -n "${AWG_MaxHandshakeAttempts:-}" ] && printf 'max_handshake_attempts=%s\n' "$AWG_MaxHandshakeAttempts"
+        true   # пустой хвост не должен ронять скрипт под set -e
+    )"
+fi
+
+# при повторном применении ответы пользователя остаются прежними
+[ "$REAPPLY" = 1 ] || cat > "$STATE_META" <<EOF
+META_PRESET=$PRESET
+META_TEMPLATE=$TEMPLATE
+META_FP=$FP
+META_HOST=$HOST
+META_MTU=$MTU
+META_GENERATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+log "Профиль сохранён в $STATE_ENV"
+echo
+echo "──────── сгенерированный [Interface]-блок ────────"
+echo "$IFACE_BLOCK"
+if [ -n "$V3_BLOCK" ]; then
+    echo "──────── параметры 3.0 (применяются через UAPI) ────────"
+    # ключ header protection — это секрет, в лог юнита ему не место
+    printf '%s\n' "$V3_BLOCK" | sed 's/^header_protection_key=.*/header_protection_key=(скрыт)/'
+fi
+echo "──────────────────────────────────────────────────"
+
+# ── применить к серверу ──────────────────────────────────────────────────────
+apply_to_server() {
+    local conf="$1" name="$2"
+    [ -f "$conf" ] || { err "Не найден $conf — пропуск ($name)"; return 0; }
+    # ВАЖНО: параметры обфускации (Jc/S/H/I) должны быть в [Interface] ДО [Peer],
+    # иначе awg setconf падает с «Line unrecognized: Jc=..». Поэтому разделяем конфиг
+    # на [Interface]-часть и [Peer]-часть, чистим старую обфускацию только в первой,
+    # вставляем свежий блок в конец [Interface], затем дописываем peers.
+    local iface peers
+    iface="$(awk '/^\[Peer\]/{exit} {print}' "$conf" \
+        | grep -vE '^__AWG3?_OBFUSCATION__$|^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5) *=' || true)"
+    peers="$(awk '/^\[Peer\]/{p=1} p' "$conf" \
+        | grep -vE '^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5) *=' || true)"
+    {
+        # [Interface]-часть без хвостовых пустых строк
+        printf '%s\n' "$iface" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+        printf '%s\n' "$IFACE_BLOCK"
+        if [ -n "$peers" ]; then printf '\n%s\n' "$peers"; fi
+    } > "$conf.new"
+    # Через временный файл и mv, а не усекающим редиректом: единственная копия
+    # списка пиров на время записи живёт в переменной, и обрыв в этом окне
+    # оставлял конфиг без единого [Peer]. Ключ сервера при этом перевыпускается
+    # вслух, у пиров такой ветки нет — они исчезали молча, а живое ядро
+    # переставало быть копией на ближайшем же перезапуске интерфейса.
+    # mv в пределах каталога атомарен: конфиг либо прежний, либо новый.
+    chmod 600 "$conf.new"
+    mv -f "$conf.new" "$conf"
+    # слой 3.0: рядом с конфигом кладём UAPI-файл с v3-параметрами
+    local v3f="${conf%.conf}.v3"
+    if [ -n "$V3_BLOCK" ]; then
+        printf '%s\n' "$V3_BLOCK" > "$v3f"
+        chmod 600 "$v3f"
+    elif [ -f "$v3f" ]; then
+        # Пустой блок означает «у этого профиля v3-параметров нет» — так
+        # объявлены пресеты router и low. Прежний .v3 оставлять НЕЛЬЗЯ:
+        # датапас применит его на ExecStartPost, сервер продолжит ждать header
+        # protection, а клиентские конфиги уже перевыпущены без неё — не
+        # подключится никто, и доктор до недавнего времени показывал ok.
+        rm -f "$v3f"
+        log "Убран прежний $v3f — у профиля нет параметров 3.0"
+    fi
+    log "Применено к $name ($conf)"
+}
+
+if [ "$APPLY" = 1 ]; then
+    ifaces=""
+    for c in $CONFS; do
+        apply_to_server "$c" "$(basename "$c" .conf)"
+        ifaces="$ifaces $(basename "$c" .conf)"
+    done
+    # Слой 3.0 живёт в userspace-юните awg3@, а не в awg-quick@: у него свой
+    # датапас (amneziawg-go) и v3-ключи, которых awg-tools не понимают —
+    # их применяет awg-datapath.sh через UAPI-сокет уже после старта.
+    # В режиме ядра слой 3.0 поднимает тот же awg-quick, что и слой 2.0
+    if [ "$V3" = 1 ] && [ "${KMOD3:-0}" != 1 ]; then unit_pfx="awg3@"; else unit_pfx="awg-quick@"; fi
+    # Наличие юнита проверяем БЕЗ конвейера. Прежнее
+    #     systemctl list-unit-files | grep -q "$unit_pfx"
+    # под `set -o pipefail` возвращает 141: `grep -q` выходит по первому
+    # совпадению и закрывает читающий конец трубы, systemctl получает SIGPIPE
+    # на остатке вывода — и весь конвейер считается упавшим. Условие оказывалось
+    # ложным, перезапуск пропускался МОЛЧА, а скрипт всё равно печатал «Готово».
+    # Профиль при этом лежал в файлах, но до работающего демона не доезжал.
+    unit_present=0
+    systemctl cat "${unit_pfx}.service" >/dev/null 2>&1 && unit_present=1
+    # Есть ли чему ломаться. На ПЕРВОЙ установке юнитов ещё нет — их ставит
+    # switch_services уже после обфускации, — интерфейсы не подняты, и тишина
+    # тут норма. Ругаться и возвращать ненулевой код нужно только тогда, когда
+    # туннель уже работает и только что разошёлся с записанным конфигом.
+    live_any=0
+    for i in $ifaces; do
+        ip link show "$i" >/dev/null 2>&1 && live_any=1
+    done
+    apply_failed=0
+    if [ "$unit_present" = 1 ]; then
+        for i in $ifaces; do
+            log "Перезапуск ${unit_pfx}${i} (чистый старт)"
+            # stop + принудительный снос интерфейса (иначе up: already exists) + start
+            systemctl stop "${unit_pfx}${i}" 2>/dev/null || true
+            ip link del "$i" 2>/dev/null || true
+            systemctl start "${unit_pfx}${i}" || {
+                err "Не удалось поднять ${unit_pfx}${i}"
+                [ "$live_any" = 1 ] && apply_failed=1
+                # завершающий true обязателен: группа — правая часть ||,
+                # и её ненулевой статус под set -e уронил бы скрипт
+                true
+            }
+        done
+    elif [ "$live_any" = 1 ]; then
+        err "Юнит ${unit_pfx}.service не найден, а интерфейсы подняты."
+        err "   Профиль записан в конфиги, но РАБОТАЮЩИЙ туннель его не получил:"
+        err "   перезапусти интерфейсы вручную, иначе сервер и клиенты разойдутся."
+        apply_failed=1
+    else
+        log "Юнитов ${unit_pfx}* ещё нет — профиль применится при их первом старте."
+    fi
+    # Параметры 3.0 живут только в памяти amneziawg-go и применяются из
+    # <iface>.v3 на ExecStartPost. Если перезапуск не случился или UAPI
+    # отказал, файлы будут правильные, а туннель — прежний. Снаружи это
+    # расхождение не видно, поэтому проверяем и говорим вслух.
+    if [ "$V3" = 1 ] && [ -n "$V3_BLOCK" ] && [ "$unit_present" = 1 ] \
+        && [ "$unit_pfx" = "awg3@" ]; then
+        v3_uapi="$(dirname "$(readlink -f "$0")")/awg-uapi.py"
+        [ -f "$v3_uapi" ] || v3_uapi="/opt/awg3/awg-uapi.py"
+        for i in $ifaces; do
+            live=""
+            [ -f "$v3_uapi" ] && live="$(python3 "$v3_uapi" show "$i" 2>/dev/null || true)"
+            case "$live" in
+                *header_protection_key*)
+                    # Совпадение по подстроке говорит лишь «какой-то ключ есть».
+                    # Демон отдаёт первые 8 символов (остальное awg-uapi.py
+                    # прячет), и этого хватает, чтобы отличить ТОТ ключ от
+                    # чужого. Профиль и .v3 пишутся двумя отдельными шагами, и
+                    # обрыв между ними оставлял источник истины и то, что
+                    # применено, с РАЗНЫМИ ключами — а скрипт объявлял успех и
+                    # звал раздавать клиентам конфиги, после чего сервер
+                    # переставал принимать весь слой 3.0.
+                    # ${STATE_ENV:-} намеренно: под set -u ненастроенная
+                    # переменная уронила бы применение профиля целиком, а без
+                    # профиля здесь просто нечего сверять.
+                    _want="$( . "${STATE_ENV:-/dev/null}" 2>/dev/null || true; printf '%s' "${AWG_HPK_HEX:-}" )"
+                    _got="$(printf '%s' "$live" | sed -n 's/.*header_protection_key *= *//p' | head -1 | cut -c1-8)"
+                    if [ -n "$_want" ] && [ -n "$_got" ] \
+                       && [ "$(printf '%s' "$_want" | cut -c1-8)" != "$_got" ]; then
+                        err "У демона ($i) ЧУЖОЙ ключ header protection: $_got вместо $(printf '%s' "$_want" | cut -c1-8)"
+                        err "   сервер и выданные конфиги не сойдутся — повтори с --v3 --apply"
+                        apply_failed=1
+                    else
+                        log "Параметры 3.0 приняты демоном ($i)"
+                    fi ;;
+                *) err "Параметры 3.0 НЕ доехали до $i — туннель работает как 2.0."
+                   err "   Смотри: journalctl -u ${unit_pfx}${i} -n 30 --no-pager"
+                   apply_failed=1 ;;
+            esac
+        done
+    fi
+    if [ "$apply_failed" = 0 ]; then
+        log "Готово. Клиентские конфиги синхронизируются автоматически (regen-all)."
+    else
+        err "НЕ ГОТОВО: профиль лёг в файлы, но до работающего туннеля не доехал."
+        exit 3
+    fi
+else
+    log "Профиль сгенерирован, но НЕ применён (--apply не задан)."
+fi
