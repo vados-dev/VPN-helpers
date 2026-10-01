@@ -1,0 +1,70 @@
+name: Static checks
+
+# Статические проверки и приёмка. Ничего не устанавливает на систему: наборы
+# работают на подставных systemctl/ip/python3 во временных каталогах и
+# разбирают настоящие файлы репозитория.
+on:
+#  push:
+#    branches: [main, beta]
+#  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — набор миграции сравнивает текущую ветку с
+      # origin/main, а неглубокий checkout тянет только саму ветку
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Проект ломается на CRLF: bash падает уже на первой строке с
+      # «invalid option name: pipefail». Ловим до того, как это доедет до
+      # сервера — установщик чистит \r только у того, что раскладывает сам.
+      - name: Переводы строк
+        run: |
+          bad="$(git ls-files -z | xargs -0 grep -lI --binary-files=without-match -P '\r$' 2>/dev/null || true)"
+          if [ -n "$bad" ]; then
+            echo "Файлы с CRLF (проект на них ломается):"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+          echo "CRLF нет"
+
+      # Статическая сборка с фиксированной версией и сверкой хэша: пакет
+      # дистрибутива обновился бы и покрасил сборку задним числом, а замена
+      # ассета в релизе прошла бы незамеченной.
+      - name: Установить shellcheck
+        run: |
+          ver=v0.11.0
+          sha=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          curl -fsSL -o sc.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz"
+          echo "$sha  sc.tar.xz" | sha256sum -c -
+          tar -xJf sc.tar.xz
+          sudo install -m0755 "shellcheck-${ver}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # Планка — warning, и дерево ей соответствует: замечаний ноль.
+      # SC1090/SC1091 отключены намеренно: почти каждый скрипт читает
+      # services.env и профили обфускации по вычисляемому пути, статически
+      # такой source не разворачивается никогда. Остальные исключения стоят
+      # точечно, в самих файлах, и каждое объяснено рядом.
+      - name: shellcheck
+        run: |
+          mapfile -t files < <(git ls-files '*.sh')
+          shellcheck -S warning -e SC1090,SC1091 "${files[@]}"
+
+      # Ubuntu 24.04 запрещает непривилегированные user namespaces через
+      # apparmor, и на раннере unshare -Urm недоступен: наборы, которые под ним
+      # запускают настоящие прогоны, молча пропускали свою главную часть и всё
+      # равно выходили с нулём.
+      - name: Разрешить непривилегированные namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -Urm --map-root-user true && echo "unshare доступен" \
+            || echo "unshare ВСЁ ЕЩЁ недоступен — наборы скажут об этом аннотацией"
+
+      - name: Приёмка
+        run: bash tests/run.sh
